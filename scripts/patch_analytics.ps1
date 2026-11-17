@@ -1,62 +1,171 @@
-# Punto Switcher Analytics Patcher
-# Run as Administrator after installation
-# Tested on Punto Switcher 4.5.0.583
+#Requires -RunAsAdministrator
+<#
+.SYNOPSIS
+  Disables Punto Switcher analytics: patches punto.exe and removes the Yandex updater.
 
-$puntoPath = "$env:LOCALAPPDATA\PuntoSwitcher"
-$puntoExe = "$puntoPath\punto.exe"
+.DESCRIPTION
+  Target: Punto Switcher 4.5.0.583 (x86). Safe by design:
+    - original bytes are verified at every offset, nothing is written on mismatch
+    - VA -> file offset is computed from the PE section table, not hardcoded
+    - the calling convention is not assumed: the script finds the function's own
+      ret / ret N and builds the stub to match (xor eax,eax + ret [N])
+    - all patches are validated first, the file is written only if every one passes
+    - a .backup of the original is kept (see restore_backup.ps1)
 
-# Check file exists
-if (-not (Test-Path $puntoExe)) {
-    Write-Error "punto.exe not found at $puntoExe"
-    exit 1
+.PARAMETER DryRun
+  Show what would be patched/removed, change nothing.
+
+.PARAMETER AddDefenderExclusion
+  Add a Defender exclusion for the punto.exe process. Use only if Defender removes
+  the patched file (the Yandex signature is broken by patching).
+#>
+[CmdletBinding()]
+param(
+    [string]$PuntoPath = (Join-Path $env:LOCALAPPDATA 'PuntoSwitcher'),
+    [switch]$DryRun,
+    [switch]$AddDefenderExclusion
+)
+
+$ErrorActionPreference = 'Stop'
+$puntoExe = Join-Path $PuntoPath 'punto.exe'
+$backup   = "$puntoExe.backup"
+
+# Functions to neutralise (virtual addresses, Punto Switcher 4.5.0.583)
+$targets = @(
+    @{ Name = 'Update check';     VA = 0x00445FB0 },
+    @{ Name = 'Stat ping thread'; VA = 0x004464C0 },
+    @{ Name = 'Click tracking';   VA = 0x00446D70 }
+)
+
+function Get-PeInfo([byte[]]$b) {
+    $pe = [BitConverter]::ToInt32($b, 0x3C)
+    if ([BitConverter]::ToUInt32($b, $pe) -ne 0x00004550) { throw 'Not a PE file.' }
+    $nSec    = [BitConverter]::ToUInt16($b, $pe + 6)
+    $optSize = [BitConverter]::ToUInt16($b, $pe + 20)
+    $opt     = $pe + 24
+    if ([BitConverter]::ToUInt16($b, $opt) -ne 0x10B) { throw 'Not a 32-bit (PE32) executable.' }
+    $info = @{ ImageBase = [int64][BitConverter]::ToUInt32($b, $opt + 28); Sections = @() }
+    $sec = $opt + $optSize
+    for ($i = 0; $i -lt $nSec; $i++) {
+        $o = $sec + 40 * $i
+        $info.Sections += @{
+            VSize   = [int64][BitConverter]::ToUInt32($b, $o + 8)
+            VA      = [int64][BitConverter]::ToUInt32($b, $o + 12)
+            RawSize = [int64][BitConverter]::ToUInt32($b, $o + 16)
+            RawPtr  = [int64][BitConverter]::ToUInt32($b, $o + 20)
+        }
+    }
+    return $info
 }
 
-# Stop Punto if running
-Get-Process | Where-Object { $_.Name -like "*punto*" -or $_.Name -like "*ps64*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+function ConvertTo-FileOffset($pe, [int64]$va) {
+    $rva = $va - $pe.ImageBase
+    foreach ($s in $pe.Sections) {
+        $size = [Math]::Max($s.VSize, $s.RawSize)
+        if ($rva -ge $s.VA -and $rva -lt ($s.VA + $size)) {
+            return [int]($rva - $s.VA + $s.RawPtr)
+        }
+    }
+    throw ('VA 0x{0:X} is not inside any section.' -f $va)
+}
+
+# Scan forward from the function entry for the first epilogue: (pop ebp | leave) + (ret | ret N).
+# All return paths of one function share the same N. Returns N, or $null if not found.
+function Find-FunctionReturn([byte[]]$b, [int]$start, [int]$maxScan = 0x4000) {
+    $end = [Math]::Min($b.Length - 4, $start + $maxScan)
+    for ($i = $start + 3; $i -lt $end; $i++) {
+        if ($b[$i] -eq 0x5D -or $b[$i] -eq 0xC9) {
+            if ($b[$i + 1] -eq 0xC3) { return 0 }
+            if ($b[$i + 1] -eq 0xC2) { return [int][BitConverter]::ToUInt16($b, $i + 2) }
+        }
+    }
+    return $null
+}
+
+if (-not (Test-Path $puntoExe)) { throw "punto.exe not found at $puntoExe" }
+
+$ver = (Get-Item $puntoExe).VersionInfo.FileVersion
+Write-Host "punto.exe version: $ver"
+if ($ver -notlike '4.5.0.583*') {
+    Write-Warning 'Expected 4.5.0.583. Offsets may not match; the byte check below decides whether it is safe.'
+}
+
+$bytes = [IO.File]::ReadAllBytes($puntoExe)
+$pe    = Get-PeInfo $bytes
+
+# ---- Plan (validate everything before touching the file) ----
+$plan = @()
+foreach ($t in $targets) {
+    $off = ConvertTo-FileOffset $pe $t.VA
+    $cur = $bytes[$off..($off + 2)]
+
+    if ($cur[0] -eq 0x31 -and $cur[1] -eq 0xC0) {
+        $plan += [pscustomobject]@{ Name = $t.Name; VA = $t.VA; Offset = $off; N = $null; Patch = $null; State = 'already patched' }
+        continue
+    }
+    if (-not ($cur[0] -eq 0x55 -and $cur[1] -eq 0x8B -and $cur[2] -eq 0xEC)) {
+        throw ('{0}: expected 55 8B EC at file offset 0x{1:X}, found {2}. Wrong version? Nothing was changed.' -f `
+            $t.Name, $off, (($cur | ForEach-Object { '{0:X2}' -f $_ }) -join ' '))
+    }
+    $n = Find-FunctionReturn $bytes $off
+    if ($null -eq $n) { throw "$($t.Name): could not locate the function's ret. Nothing was changed." }
+    if (($n % 4) -ne 0 -or $n -gt 64) { throw "$($t.Name): suspicious ret $n. Nothing was changed." }
+
+    if ($n -eq 0) {
+        $patch = [byte[]](0x31, 0xC0, 0xC3)
+    } else {
+        $patch = [byte[]](0x31, 0xC0, 0xC2, ($n -band 0xFF), (($n -shr 8) -band 0xFF))
+    }
+    $plan += [pscustomobject]@{ Name = $t.Name; VA = $t.VA; Offset = $off; N = $n; Patch = $patch; State = 'pending' }
+}
+
+Write-Host ''
+foreach ($p in $plan) {
+    if ($p.State -eq 'pending') {
+        $stub = ($p.Patch | ForEach-Object { '{0:X2}' -f $_ }) -join ' '
+        Write-Host ('{0,-17} VA 0x{1:X8}  offset 0x{2:X}  ret {3,-2} ->  {4}' -f $p.Name, $p.VA, $p.Offset, $p.N, $stub)
+    } else {
+        Write-Host ('{0,-17} VA 0x{1:X8}  already patched' -f $p.Name, $p.VA)
+    }
+}
+
+$toRemove = @('yupdate.exe', 'yupdate.dll', 'Updater') | ForEach-Object { Join-Path $PuntoPath $_ }
+
+if ($DryRun) {
+    Write-Host ''
+    Write-Host 'DryRun: nothing was changed. Would remove (if present):'
+    $toRemove | ForEach-Object { Write-Host "  $_" }
+    return
+}
+
+# ---- Apply ----
+Get-Process -Name punto, ps64ldr -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Seconds 2
 
-# Remove read-only
-Set-ItemProperty $puntoExe -Name IsReadOnly -Value $false
+$pending = @($plan | Where-Object { $_.State -eq 'pending' })
+if ($pending.Count -gt 0) {
+    Set-ItemProperty $puntoExe -Name IsReadOnly -Value $false
+    if (-not (Test-Path $backup)) {
+        Copy-Item $puntoExe $backup
+        Write-Host "Backup created: $backup"
+    }
+    foreach ($p in $pending) {
+        for ($k = 0; $k -lt $p.Patch.Length; $k++) { $bytes[$p.Offset + $k] = $p.Patch[$k] }
+    }
+    [IO.File]::WriteAllBytes($puntoExe, $bytes)
 
-# Backup
-$backup = "$puntoExe.backup"
-if (-not (Test-Path $backup)) {
-    Copy-Item $puntoExe $backup
-    Write-Host "Backup created: $backup"
+    # verify what actually landed on disk
+    $check = [IO.File]::ReadAllBytes($puntoExe)
+    foreach ($p in $pending) {
+        for ($k = 0; $k -lt $p.Patch.Length; $k++) {
+            if ($check[$p.Offset + $k] -ne $p.Patch[$k]) { throw "Verification failed for $($p.Name). Run restore_backup.ps1." }
+        }
+    }
+    Write-Host 'Patches written and verified.'
+} else {
+    Write-Host 'punto.exe is already patched.'
 }
 
-# Read binary
-$bytes = [System.IO.File]::ReadAllBytes($puntoExe)
-
-# VA to file offset
-# ImageBase = 0x400000, .text: VA=0x1000, FileOffset=0x400
-function VA-ToOffset($va) { return $va - 0x400000 - 0x1000 + 0x400 }
-
-# Patch analytics functions
-# XOR EAX, EAX (31 C0) + RET (C3) = return 0 immediately
-$patches = @{
-    "PingStatThread (0x4464C0)"     = 0x004464C0
-    "Update check (0x445FB0)"       = 0x00445FB0
-    "Click tracking (0x446D70)"     = 0x00446D70
-}
-
-foreach ($name in $patches.Keys) {
-    $offset = VA-ToOffset $patches[$name]
-    $original = $bytes[$offset..($offset+2)] | ForEach-Object { '{0:X2}' -f $_ }
-    $bytes[$offset]   = 0x31  # XOR EAX, EAX
-    $bytes[$offset+1] = 0xC0
-    $bytes[$offset+2] = 0xC3  # RET
-    Write-Host "Patched: $name | was: $($original -join ' ') -> 31 C0 C3"
-}
-
-# Write patched binary
-[System.IO.File]::WriteAllBytes($puntoExe, $bytes)
-Write-Host ""
-Write-Host "Done! Analytics functions patched."
-Write-Host ""
-
-# Remove updater components
-$toRemove = @("$puntoPath\yupdate.exe", "$puntoPath\yupdate.dll", "$puntoPath\Updater")
 foreach ($item in $toRemove) {
     if (Test-Path $item) {
         Remove-Item $item -Recurse -Force
@@ -64,11 +173,10 @@ foreach ($item in $toRemove) {
     }
 }
 
-# Add Windows Defender exclusions
-Add-MpPreference -ExclusionPath $puntoPath -ErrorAction SilentlyContinue
-Add-MpPreference -ExclusionProcess "punto.exe" -ErrorAction SilentlyContinue
-Add-MpPreference -ExclusionProcess "ps64ldr.exe" -ErrorAction SilentlyContinue
-Write-Host "Defender exclusions added."
+if ($AddDefenderExclusion) {
+    Add-MpPreference -ExclusionProcess 'punto.exe'
+    Write-Warning 'Defender will not scan the punto.exe process. Remove with: Remove-MpPreference -ExclusionProcess punto.exe'
+}
 
-Write-Host ""
-Write-Host "All done! Punto Switcher analytics removed."
+Write-Host ''
+Write-Host 'Done. Static patch only - verify with Procmon/Wireshark that no Yandex traffic remains.'
